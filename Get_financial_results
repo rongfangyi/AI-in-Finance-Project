@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+
+# 读取 Excel 文件
+excel_file = pd.ExcelFile('DailyClosing-Indices-2019-24.xlsx')
+
+# 获取指数与国家对应关系
+indices_df = excel_file.parse('Indices')
+index_country_map = dict(zip(indices_df['Index'], indices_df['Country']))
+
+# 获取所有指数工作表名
+sheet_names = [sheet for sheet in excel_file.sheet_names if sheet != 'Indices']
+
+# 存储每个国家的结果
+country_results = {}
+# 存储每个指数的对数收益率和日期
+index_log_returns = {}
+
+# 遍历不同工作表
+for sheet_name in sheet_names:
+    # 获取当前工作表的数据
+    df = excel_file.parse(sheet_name)
+    # 检查日期列和收盘价列是否存在且数据完整
+    if 'Date' not in df.columns or 'Close' not in df.columns:
+        print(f"工作表 {sheet_name} 缺少关键列，跳过该工作表。")
+        continue
+    if df['Date'].isnull().any() or df['Close'].isnull().any():
+        print(f"工作表 {sheet_name} 存在缺失值，跳过该工作表。")
+        continue
+    # 将日期列转换为日期时间类型
+    df['Date'] = pd.to_datetime(df['Date'])
+    # 按日期排序数据，确保数据顺序正确
+    df = df.sort_values(by='Date').reset_index(drop=True)
+
+    # 计算对数收益率
+    df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    index_log_returns[sheet_name] = df[['Date', 'Log_Returns']]
+
+    # 计算对数收益率的标准差
+    volatility = df['Log_Returns'].std()
+
+    # 计算风险价值（VaR），假设为 95% 的置信水平
+    z_score = norm.ppf(0.05)
+    VaR = z_score * volatility
+
+    # 计算条件风险价值（CvaR）
+    CvaR = df['Log_Returns'][df['Log_Returns'] < VaR].mean()
+
+    # 计算方向性变化的频率（NDC）
+    df['Directional_Change'] = np.where(df['Log_Returns'] > 0, 1, -1)
+    NDC = df['Directional_Change'].value_counts(normalize=True).get(1, 0)
+
+    # 计算趋势幅度（TMV）
+    df['Trend'] = df['Directional_Change'].diff()
+    df['Trend_Magnitude'] = np.abs(df['Log_Returns']) * (df['Trend'] != 0)
+    TMV = df['Trend_Magnitude'].sum()
+
+    # 计算单个趋势中的回报
+    df['Trend_Start'] = (df['Trend'] != 0) & (df['Trend'] != np.nan)
+    df['Trend_Group'] = df['Trend_Start'].cumsum()
+    trend_returns = df.groupby('Trend_Group')['Log_Returns'].sum()
+
+    # 获取国家名称
+    country = index_country_map.get(sheet_name)
+    if country not in country_results:
+        country_results[country] = {
+            'Volatility': [],
+            'VaR': [],
+            'CvaR': [],
+            'NDC': [],
+            'TMV': [],
+            'Trend_Returns': []
+        }
+
+    # 存储结果
+    country_results[country]['Volatility'].append(volatility)
+    country_results[country]['VaR'].append(VaR)
+    country_results[country]['CvaR'].append(CvaR)
+    country_results[country]['NDC'].append(NDC)
+    country_results[country]['TMV'].append(TMV)
+    country_results[country]['Trend_Returns'].extend(trend_returns)
+
+# 计算每个国家各项指标的平均值
+for country, metrics in country_results.items():
+    for metric, values in metrics.items():
+        if metric == 'Trend_Returns':
+            continue
+        metrics[metric] = np.mean(values)
+
+# 创建一个 DataFrame 来存储最终结果
+result_df = pd.DataFrame(columns=['Country', 'Volatility', 'VaR', 'CvaR', 'NDC', 'TMV', 'Trend_Returns'])
+for country, metrics in country_results.items():
+    row = {
+        'Country': country,
+        'Volatility': metrics['Volatility'],
+        'VaR': metrics['VaR'],
+        'CvaR': metrics['CvaR'],
+        'NDC': metrics['NDC'],
+        'TMV': metrics['TMV'],
+        'Trend_Returns': str(metrics['Trend_Returns'])
+    }
+    result_df = pd.concat([result_df, pd.DataFrame([row])], ignore_index=True)
+
+# 将结果保存到 Excel 文件
+result_df.to_excel('financial_metrics_results.xlsx', index=False)
+print("结果已保存到 financial_metrics_results.xlsx 文件中。")
+
+# 可视化
+# 对数收益时间序列
+for index, data in index_log_returns.items():
+    data.set_index('Date')['Log_Returns'].plot(figsize=(10, 6))
+    plt.title(f'{index} Daily Log Returns')
+    plt.show()
+
+# 风险指标比较
+index_risk_metrics = {}
+for index, data in index_log_returns.items():
+    log_returns = data['Log_Returns']
+    std_dev = log_returns.std()
+    z_score = norm.ppf(0.05)
+    var_95 = z_score * std_dev
+    es_95 = log_returns[log_returns < var_95].mean()
+    index_risk_metrics[index] = {'Std Dev': std_dev, 'VaR (95%)': var_95, 'ES (95%)': es_95}
+
+risk_metrics_df = pd.DataFrame(index_risk_metrics).T
+risk_metrics_df.plot(kind='bar', figsize=(10, 6))
+plt.title('Risk Metrics Comparison')
+plt.show()
+
+# 比较不同指数
+# 计算每个指数的平均对数收益率
+index_avg_log_returns = {index: data['Log_Returns'].mean() for index, data in index_log_returns.items()}
+# 按平均对数收益率排序
+sorted_index_avg_log_returns = sorted(index_avg_log_returns.items(), key=lambda x: x[1], reverse=True)
+print("按平均对数收益率排序的指数：")
+for index, avg_log_return in sorted_index_avg_log_returns:
+    print(f"{index}: {avg_log_return}")
+
+# 检查指数之间的相关性
+log_returns_df = pd.DataFrame({index: data['Log_Returns'] for index, data in index_log_returns.items()})
+correlation_matrix = log_returns_df.corr()
+print("指数之间的相关性矩阵：")
+print(correlation_matrix)
+
+# 时间分段分析
+for index, data in index_log_returns.items():
+    pre_2024 = data[data['Date'].dt.year < 2024]['Log_Returns']
+    post_2024 = data[data['Date'].dt.year == 2024]['Log_Returns']
+
+    # 计算分段风险指标
+    std_dev_pre = pre_2024.std()
+    std_dev_post = post_2024.std()
+
+    print(f"{index} 2019 - 2023 标准差: {std_dev_pre}")
+    print(f"{index} 2024 标准差: {std_dev_post}")
